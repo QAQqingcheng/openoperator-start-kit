@@ -1,23 +1,10 @@
+// ==================== conv2d.mlu ====================
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
 
-/**
- * @brief 二维卷积核函数（带填充和空洞）
- * @param input       输入张量 [batch, in_c, H, W]
- * @param kernel      卷积核 [out_c, in_c, K, K]
- * @param output      输出张量 [batch, out_c, H_out, W_out]
- * @param batch       批大小
- * @param in_c        输入通道数
- * @param out_c       输出通道数
- * @param H           输入高度
- * @param W           输入宽度
- * @param H_out       输出高度
- * @param W_out       输出宽度
- * @param kernel_size 卷积核大小
- * @param dilation    空洞系数
- * @param padding     填充宽度
- */
+#define CHUNK_SIZE 4096
+
 __mlu_entry__ void conv2d_kernel(
     const float* input,
     const float* kernel,
@@ -33,48 +20,74 @@ __mlu_entry__ void conv2d_kernel(
     int dilation,
     int padding) {
 
-    // 总输出元素个数
+    // ========== 多核任务拆分 ==========
     int total = batch * out_c * H_out * W_out;
-
-    // 多核任务拆分（与示例 LeakyReLU 相同策略）
     uint32_t core_id   = taskId;
     uint32_t core_num  = taskDim;
     uint32_t per_core  = total / core_num;
     uint32_t remainder = total % core_num;
 
-    uint32_t start = core_id * per_core + (core_id < remainder ? core_id : remainder);
-    uint32_t count = per_core + (core_id < remainder ? 1 : 0);
+    uint32_t start = core_id * per_core +
+                     (core_id < remainder ? core_id : remainder);
+    uint32_t count = per_core +
+                     (core_id < remainder ? 1 : 0);
 
-    // 每个核独立计算自己负责的输出元素
-    for (uint32_t idx = start; idx < start + count; ++idx) {
-        // 将线性索引映射为 (n, oc, hout, wout)
-        int n   = idx / (out_c * H_out * W_out);
-        int rem = idx % (out_c * H_out * W_out);
-        int oc  = rem / (H_out * W_out);
-        int spt = rem % (H_out * W_out);
-        int hout = spt / W_out;
-        int wout = spt % W_out;
+    // ========== NRAM 缓冲区 ==========
+    __nram__ float nram_out[CHUNK_SIZE];
 
-        float sum = 0.0f;
-        // 卷积累加循环
-        for (int ic = 0; ic < in_c; ++ic) {
-            for (int kh = 0; kh < kernel_size; ++kh) {
-                for (int kw = 0; kw < kernel_size; ++kw) {
-                    int hin = hout - padding + kh * dilation;
-                    int win = wout - padding + kw * dilation;
-                    if (hin >= 0 && hin < H && win >= 0 && win < W) {
-                        float x_val = input[((n * in_c + ic) * H + hin) * W + win];
-                        float k_val = kernel[((oc * in_c + ic) * kernel_size + kh) * kernel_size + kw];
-                        sum += x_val * k_val;
+    // 本核负责的输出元素范围
+    uint32_t end = start + count;
+
+    for (uint32_t base = start; base < end; base += CHUNK_SIZE) {
+
+        uint32_t len = (base + CHUNK_SIZE <= end)
+                           ? CHUNK_SIZE
+                           : (end - base);
+
+        // 逐元素计算并写入 NRAM
+        for (uint32_t local = 0; local < len; ++local) {
+            uint32_t idx = base + local;
+
+            // 线性索引 → (n, oc, hout, wout)
+            int n   = idx / (out_c * H_out * W_out);
+            int rem = idx % (out_c * H_out * W_out);
+            int oc  = rem / (H_out * W_out);
+            int spt = rem % (H_out * W_out);
+            int hout = spt / W_out;
+            int wout = spt % W_out;
+
+            float sum = 0.0f;
+
+            // 三层循环完成卷积累加
+            for (int ic = 0; ic < in_c; ++ic) {
+                for (int kh = 0; kh < kernel_size; ++kh) {
+                    for (int kw = 0; kw < kernel_size; ++kw) {
+                        int hin = hout - padding + kh * dilation;
+                        int win = wout - padding + kw * dilation;
+                        if (hin >= 0 && hin < H && win >= 0 && win < W) {
+                            float x_val = input[
+                                ((n * in_c + ic) * H + hin) * W + win];
+                            float k_val = kernel[
+                                ((oc * in_c + ic) * kernel_size + kh) * kernel_size + kw];
+                            sum += x_val * k_val;
+                        }
                     }
                 }
             }
+            nram_out[local] = sum;
         }
-        output[idx] = sum;
+
+        // NRAM → GDRAM 批量写回
+        __memcpy(
+            output + base,
+            nram_out,
+            len * sizeof(float),
+            NRAM2GDRAM);
     }
 }
 
 
+// ==================== C++ Wrapper ====================
 torch::Tensor bang_func(
     torch::Tensor x,
     torch::Tensor kernel,
@@ -87,15 +100,16 @@ torch::Tensor bang_func(
     TORCH_CHECK(x.is_contiguous(),     "Input must be contiguous");
     TORCH_CHECK(kernel.is_contiguous(), "Kernel must be contiguous");
 
-    // 计算输出特征图尺寸（Stride 固定为 1）
+    int batch = x.size(0);
     int H = x.size(2);
     int W = x.size(3);
+
+    // 输出尺寸（stride = 1）
     int H_out = H + 2 * padding - dilation * (kernel_size - 1);
     int W_out = W + 2 * padding - dilation * (kernel_size - 1);
 
+    // 类型统一为 float
     auto original_dtype = x.scalar_type();
-
-    // 统一转为 float32 以保证精度
     torch::Tensor x_fp32 = x;
     torch::Tensor k_fp32 = kernel;
     if (original_dtype != torch::kFloat) {
@@ -103,17 +117,12 @@ torch::Tensor bang_func(
         k_fp32 = kernel.to(torch::kFloat);
     }
 
-    auto output_fp32 = torch::empty({x.size(0), out_channels, H_out, W_out},
-                                    x_fp32.options());
+    auto output_fp32 = torch::empty(
+        {batch, out_channels, H_out, W_out},
+        x_fp32.options());
 
-    int batch  = x.size(0);
-    int in_c   = in_channels;
-    int out_c  = out_channels;
-
-    // 获取 MLU 执行队列
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    // 启动核函数（此处使用 4 个核，可根据需要增大）
     cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
@@ -122,21 +131,18 @@ torch::Tensor bang_func(
         k_fp32.data_ptr<float>(),
         output_fp32.data_ptr<float>(),
         batch,
-        in_c,
-        out_c,
+        in_channels,
+        out_channels,
         H,
         W,
         H_out,
         W_out,
         kernel_size,
         dilation,
-        padding
-    );
+        padding);
 
-    // 转回原始类型
     if (original_dtype != torch::kFloat) {
         return output_fp32.to(original_dtype);
     }
-
     return output_fp32;
 }
