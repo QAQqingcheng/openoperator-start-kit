@@ -3,142 +3,148 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#define NRAM_SIZE (256 * 1024)  // 256KB NRAM
+#define NRAM_HALF_SIZE (128 * 1024)  // 128K half 元素
 
 /**
- * 核函数：处理不规则形状的矩阵乘法
- * A: [M, K], B: [K, N], C: [M, N]
- * 支持非对齐的 M, N, K
+ * 核函数：带空洞和填充的二维卷积 (float16)
+ * x:      [batch, in_channels, H, W]
+ * kernel: [out_channels, in_channels, kernel_size, kernel_size]
+ * output: [batch, out_channels, H_out, W_out]
  */
-__mlu_entry__ void matmul_irregular_kernel(
-    half *A,        // 输入 A [M, K]
-    half *B,        // 输入 B [K, N]
-    half *C,        // 输出 C [M, N]
-    int M,
-    int N,
-    int K)
+__mlu_entry__ void dilated_conv2d_kernel(
+    half *x,
+    half *kernel,
+    half *output,
+    int batch,
+    int in_channels,
+    int out_channels,
+    int H,
+    int W,
+    int kernel_size,
+    int dilation,
+    int padding)
 {
-    // 多核拆分：按输出行 M 维度拆分
+    // 输出尺寸
+    int H_out = (H + 2 * padding - dilation * (kernel_size - 1) - 1) + 1;
+    int W_out = (W + 2 * padding - dilation * (kernel_size - 1) - 1) + 1;
+    int total_out = batch * out_channels * H_out * W_out;
+
+    // 多核拆分
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
-    uint32_t per_core = M / core_num;
-    uint32_t remainder = M % core_num;
+    uint32_t per_core = total_out / core_num;
+    uint32_t remainder = total_out % core_num;
 
-    uint32_t m_start = core_id * per_core + (core_id < remainder ? core_id : remainder);
-    uint32_t m_count = per_core + (core_id < remainder ? 1 : 0);
-    if (m_count == 0) return;
-
-    // ---------- 对齐参数 ----------
-    // K 按 64 对齐（half = 2字节，64元素=128字节，满足 NRAM 对齐要求）
-    int aligned_k = (K + 63) & ~63;
-
-    // 每块处理的 N 列数（根据 NRAM 大小估算）
-    int max_n_block = NRAM_SIZE / (aligned_k * sizeof(half) * 2 + 4096);
-    if (max_n_block < 1) max_n_block = 1;
-    if (max_n_block > N) max_n_block = N;
-
-    int n_blocks = (N + max_n_block - 1) / max_n_block;
+    uint32_t start = core_id * per_core + (core_id < remainder ? core_id : remainder);
+    uint32_t count = per_core + (core_id < remainder ? 1 : 0);
+    if (count == 0) return;
 
     // NRAM 缓冲区
-    __nram__ half nram_a_row[4096];    // 存储当前行 A，最大 K 对齐后长度
-    __nram__ half nram_b_block[4096];  // 存储 B 的一个列块
-    __nram__ float nram_c_part[4096];  // 累加结果（float 精度）
-    __nram__ half nram_c_half[4096];   // 转回 half 的结果
+    __nram__ float nram_accum;
 
-    for (uint32_t mi = 0; mi < m_count; ++mi) {
-        int m_idx = m_start + mi;
+    for (uint32_t i = 0; i < count; ++i) {
+        int global_idx = start + i;
 
-        // 将 A 的第 m_idx 行加载到 NRAM
-        __memcpy(nram_a_row,
-                 A + m_idx * K,
-                 K * sizeof(half),
-                 GDRAM2NRAM);
-        // 将对齐部分（超出 K 的部分）置零
-        if (aligned_k > K) {
-            // 使用循环赋零代替 __bang_memset
-            for (int i = K; i < aligned_k; i++) {
-                nram_a_row[i] = (half)0.0f;
+        // 将一维索引映射到 [n, c_out, h, w]
+        int n = global_idx / (out_channels * H_out * W_out);
+        int r1 = global_idx % (out_channels * H_out * W_out);
+        int c_out = r1 / (H_out * W_out);
+        int r2 = r1 % (H_out * W_out);
+        int h_out = r2 / W_out;
+        int w_out = r2 % W_out;
+
+        // 计算对应输入起始位置（考虑 padding）
+        int h_in_start = h_out - padding;
+        int w_in_start = w_out - padding;
+
+        float sum = 0.0f;
+
+        // 遍历输入通道和卷积核
+        for (int c_in = 0; c_in < in_channels; ++c_in) {
+            for (int ki = 0; ki < kernel_size; ++ki) {
+                int h_in = h_in_start + ki * dilation;
+                if (h_in < 0 || h_in >= H) continue;
+
+                for (int kj = 0; kj < kernel_size; ++kj) {
+                    int w_in = w_in_start + kj * dilation;
+                    if (w_in < 0 || w_in >= W) continue;
+
+                    // 计算输入元素地址
+                    int x_idx = n * (in_channels * H * W)
+                              + c_in * (H * W)
+                              + h_in * W
+                              + w_in;
+
+                    // 计算卷积核元素地址
+                    int k_idx = c_out * (in_channels * kernel_size * kernel_size)
+                              + c_in * (kernel_size * kernel_size)
+                              + ki * kernel_size
+                              + kj;
+
+                    sum += (float)x[x_idx] * (float)kernel[k_idx];
+                }
             }
         }
 
-        // 按列块处理
-        for (int nb = 0; nb < n_blocks; ++nb) {
-            int n_start = nb * max_n_block;
-            int cur_n = (nb == n_blocks - 1) ? (N - n_start) : max_n_block;
-            if (cur_n <= 0) break;
-            int aligned_n = (cur_n + 63) & ~63;
-
-            // 初始化累加器为 0（float）
-            for (int i = 0; i < aligned_n; i++) {
-                nram_c_part[i] = 0.0f;
-            }
-
-            // 加载 B 的列块：B[0:K, n_start:n_start+cur_n]
-            // B 按行存储，但我们需要按列访问，所以需要分段加载
-            // 这里简化：将 B 的该列块逐行复制到 NRAM 的连续区域
-            for (int k = 0; k < K; ++k) {
-                // 复制 B[k][n_start:n_start+cur_n] 到 nram_b_block
-                __memcpy(nram_b_block,
-                         B + k * N + n_start,
-                         cur_n * sizeof(half),
-                         GDRAM2NRAM);
-                // 对齐部分补零
-                for (int i = cur_n; i < aligned_n; i++) {
-                    nram_b_block[i] = (half)0.0f;
-                }
-
-                // 标量乘法累加：a_row[k] * b_block[0:aligned_n]
-                half a_val = nram_a_row[k];
-                for (int i = 0; i < aligned_n; i++) {
-                    nram_c_part[i] += (float)a_val * (float)nram_b_block[i];
-                }
-            }
-
-            // 将 float 结果转回 half
-            for (int i = 0; i < aligned_n; i++) {
-                nram_c_half[i] = (half)nram_c_part[i];
-            }
-
-            // 写回 C[m_idx][n_start:n_start+cur_n]
-            __memcpy(C + m_idx * N + n_start,
-                     nram_c_half,
-                     cur_n * sizeof(half),
-                     NRAM2GDRAM);
-        }
+        output[global_idx] = (half)sum;
     }
 }
 
 /**
- * 外部调用函数
+ * 外部调用函数：必须与 C++ Wrapper 签名完全一致
+ * torch::Tensor bang_func(torch::Tensor x, torch::Tensor kernel,
+ *                         int in_channels, int out_channels,
+ *                         int kernel_size, int dilation, int padding);
  */
 torch::Tensor bang_func(
-    torch::Tensor A,
-    torch::Tensor B,
-    int M,
-    int N,
-    int K)
+    torch::Tensor x,
+    torch::Tensor kernel,
+    int in_channels,
+    int out_channels,
+    int kernel_size,
+    int dilation,
+    int padding)
 {
-    TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
-    TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
-    TORCH_CHECK(A.scalar_type() == torch::kHalf, "A must be float16");
-    TORCH_CHECK(B.scalar_type() == torch::kHalf, "B must be float16");
-    TORCH_CHECK(A.size(0) == M && A.size(1) == K, "A shape mismatch");
-    TORCH_CHECK(B.size(0) == K && B.size(1) == N, "B shape mismatch");
+    // 类型检查
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(kernel.is_contiguous(), "kernel must be contiguous");
+    TORCH_CHECK(x.scalar_type() == torch::kHalf, "x must be float16");
+    TORCH_CHECK(kernel.scalar_type() == torch::kHalf, "kernel must be float16");
 
-    auto C = torch::empty({M, N}, A.options());
+    // 获取输入形状
+    auto dims = x.sizes();
+    int batch = dims[0];
+    int H = dims[2];
+    int W = dims[3];
 
+    // 计算输出尺寸
+    int H_out = (H + 2 * padding - dilation * (kernel_size - 1) - 1) + 1;
+    int W_out = (W + 2 * padding - dilation * (kernel_size - 1) - 1) + 1;
+
+    // 创建输出张量
+    auto output = torch::empty({batch, out_channels, H_out, W_out}, x.options());
+
+    // 获取 MLU 流
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
+    // 设置并行维度（4 核）
     cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
-    // 关键修正：使用 reinterpret_cast<half*> 进行类型转换
-    matmul_irregular_kernel<<<dim, ktype, queue>>>(
-        reinterpret_cast<half*>(A.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(B.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(C.data_ptr<at::Half>()),
-        M, N, K
+    // 启动核函数
+    dilated_conv2d_kernel<<<dim, ktype, queue>>>(
+        reinterpret_cast<half*>(x.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(kernel.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(output.data_ptr<at::Half>()),
+        batch,
+        in_channels,
+        out_channels,
+        H,
+        W,
+        kernel_size,
+        dilation,
+        padding
     );
 
-    return C;
+    return output;
 }
