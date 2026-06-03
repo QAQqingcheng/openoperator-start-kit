@@ -1,57 +1,17 @@
 #include <bang.h>
 #include <torch/extension.h>
 
-// 核函数：使用硬件加速的矩阵乘法指令
-// 因为矩阵很大，需要多个 cluster 并行处理
+// 核函数：单个 block 执行整个矩阵乘法
 __mlu_entry__ void matmul_kernel(half* A, half* B, half* C,
                                  int M, int N, int K) {
-    // 获取当前 cluster 的索引
-    int cluster_id = __builtin_get_cluster_id();
-    int cluster_num = __builtin_get_cluster_count();
-
-    // 将输出矩阵 C 按行分块，每个 cluster 处理连续的一段行
-    int rows_per_cluster = (M + cluster_num - 1) / cluster_num;
-    int start_row = cluster_id * rows_per_cluster;
-    int end_row = min(start_row + rows_per_cluster, M);
-    int local_rows = end_row - start_row;
-
-    if (local_rows <= 0) return;
-
-    // 为当前 cluster 分配 NRAM 空间（每个 cluster 独立）
-    __nram__ half tileA[local_rows * K];
-    __nram__ half tileB[K * N];   // 整个 B 矩阵（K x N）可能过大，但 N=5921, K=2949 乘积约 17M 个 half，约 34MB，超过 NRAM 大小
-    // 实际上不能把整个 B 放进去，需要进一步分块。更简单的方法：直接调用 __bang_matmul 并利用硬件自动分块
+    // 8 参数版本：dst, srcA, srcB, M, N, K, lda, ldb
+    // 假设 A 行主序，lda = K；B 行主序，ldb = N
+    __bang_matmul(C, A, B, M, N, K, K, N);
 }
 
-// 更简单可靠的方法：直接调用 __bang_matmul，让硬件处理所有分块和并行
-// 但需要启动足够多的 cluster 来利用所有计算单元
-__mlu_entry__ void matmul_simple_kernel(half* A, half* B, half* C,
-                                        int M, int N, int K) {
-    // __bang_matmul 会自动在 cluster 内并行，但如果是单个 cluster，可能性能不足
-    // 对于大矩阵，我们应该让每个 cluster 独立计算一部分结果
-    // 使用 cluster_id 来分块输出
-    int cluster_id = __builtin_get_cluster_id();
-    int cluster_num = __builtin_get_cluster_count();
-
-    // 将输出矩阵 C 按行分块，每个 cluster 负责一个连续的行区间
-    int rows_per_cluster = (M + cluster_num - 1) / cluster_num;
-    int start_row = cluster_id * rows_per_cluster;
-    int actual_rows = min(rows_per_cluster, M - start_row);
-    if (actual_rows <= 0) return;
-
-    // 计算当前 cluster 的输出起始指针
-    half* C_part = C + start_row * N;
-    half* A_part = A + start_row * K;
-
-    // 调用 __bang_matmul 计算子矩阵乘法：C_part = A_part * B
-    // 注意：__bang_matmul 内部会处理 B 的广播（实际上 B 完整参与）
-    // 参数：C, A, B, M, N, K, lda, ldb, ldc
-    __bang_matmul(C_part, A_part, B, actual_rows, N, K, K, N, N);
-}
-
-// 对外接口
+// 对外接口（必须命名为 bang_func）
 torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
-    // 维度检查
+    // 1. 输入校验
     TORCH_CHECK(A.dim() == 2 && B.dim() == 2, "Inputs must be 2D");
     TORCH_CHECK(A.size(1) == B.size(0), "Inner dimension mismatch");
     TORCH_CHECK(A.scalar_type() == torch::kFloat16 && B.scalar_type() == torch::kFloat16,
@@ -61,21 +21,20 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     int K = A.size(1);
     int N = B.size(1);
 
-    // 创建输出 tensor
+    // 2. 创建输出张量
     auto C = torch::empty({M, N}, A.options());
 
+    // 3. 获取设备指针
     half* A_ptr = reinterpret_cast<half*>(A.data_ptr());
     half* B_ptr = reinterpret_cast<half*>(B.data_ptr());
     half* C_ptr = reinterpret_cast<half*>(C.data_ptr());
 
-    // 配置启动参数：使用多个 cluster 来并行处理
-    // 获取硬件最大 cluster 数量（通常为 4 或更多）
-    int max_clusters = __mlu_get_max_cluster_count();
-    int num_clusters = max_clusters;
-    cnrtDim3_t dim = {num_clusters, 1, 1};
-    cnrtFunctionType_t ktype = CNRT_FUNC_TYPE_UNION1;  // 每个 cluster 一个 block
+    // 4. 配置启动参数（单个 cluster，单个 block）
+    cnrtDim3_t dim = {1, 1, 1};
+    cnrtFunctionType_t ktype = CNRT_FUNC_TYPE_BLOCK;
 
-    matmul_simple_kernel<<<dim, ktype, 0>>>(A_ptr, B_ptr, C_ptr, M, N, K);
+    // 5. 启动核函数
+    matmul_kernel<<<dim, ktype, 0>>>(A_ptr, B_ptr, C_ptr, M, N, K);
 
     return C;
 }
