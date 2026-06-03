@@ -1,153 +1,152 @@
-// bang.mlu
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
 
-// 最大参数值
-#define MAX_IN_CH 64
-#define MAX_OUT_CH 128
-#define MAX_HW 128
-#define MAX_KERNEL 3
-#define KERNEL_VOL (MAX_IN_CH * MAX_KERNEL * MAX_KERNEL)  // 64*9 = 576
+// 权重块的最大元素数（根据 NRAM 容量设定，这里设为 16384 ≈ 64 KB）
+#define MAX_NRAM_WEIGHT_ELEMS 16384
 
-/**
- * 核函数：带空洞和填充的二维卷积 (float16) — 优化版
- * 
- * 策略：
- *   - 所有核权重一次性加载到 NRAM（144 KB，可容纳全部 128 个输出通道）
- *   - 按输出行逐行处理，每行所需的输入行通过 DMA 批量加载
- *   - 使用 __bang_mul_scalar + __bang_add 向量化累加
- *   - 每个核心负责一组输出通道
- */
-__mlu_entry__ void dilated_conv2d_kernel(
-    half *x,
-    half *kernel,
-    half *output,
-    int batch,
-    int in_channels,
-    int out_channels,
+/*----------------------------------------------------------------------------
+ * 核函数：二维卷积（支持 padding 和 dilation，stride = 1）
+ * 参数：
+ *   input      : 输入 [N, C_in, H, W]  float*
+ *   kernel     : 卷积核 [C_out, C_in, K, K]  float*
+ *   output     : 输出 [N, C_out, H_out, W_out]  float*
+ *   N, C_in, H, W : 输入各维度
+ *   C_out      : 输出通道数
+ *   K          : 卷积核尺寸（正方形）
+ *   dilation   : 膨胀系数
+ *   padding    : 单边填充宽度
+ *--------------------------------------------------------------------------*/
+__mlu_entry__ void conv2d_kernel(
+    float *input,
+    float *kernel,
+    float *output,
+    int N,
+    int C_in,
     int H,
     int W,
-    int kernel_size,
+    int C_out,
+    int K,
     int dilation,
     int padding)
 {
-    // 输出尺寸
-    int H_out = (H + 2 * padding - dilation * (kernel_size - 1) - 1) + 1;
-    int W_out = (W + 2 * padding - dilation * (kernel_size - 1) - 1) + 1;
-    int kernel_vol = in_channels * kernel_size * kernel_size;
+    // 计算输出特征图尺寸
+    int H_out = H + 2 * padding - dilation * (K - 1);
+    int W_out = W + 2 * padding - dilation * (K - 1);
 
-    // 多核拆分：按输出通道分配
-    uint32_t core_id = taskId;
-    uint32_t core_num = taskDim;
-    uint32_t per_core = out_channels / core_num;
-    uint32_t rem = out_channels % core_num;
-    uint32_t co_start = core_id * per_core + (core_id < rem ? core_id : rem);
-    uint32_t co_count = per_core + (core_id < rem ? 1 : 0);
-    if (co_count == 0) return;
+    // 多核拆分：按输出通道划分
+    uint32_t core_id   = taskId;
+    uint32_t core_num  = taskDim;
 
-    // ---- NRAM 缓冲区 ----
-    // 1) 所有输出通道的核权重 (out_channels × in_channels × 3 × 3)
-    //    限制: out_channels <= 128, in_channels <= 64 → 128*64*9 = 73728 halfs ≈ 144KB
-    __nram__ half nram_all_kernels[MAX_OUT_CH * KERNEL_VOL];
+    uint32_t out_c_per_core = C_out / core_num;
+    uint32_t out_c_rem      = C_out % core_num;
+    // 本核负责的输出通道起始索引和数量
+    uint32_t out_c_start = core_id * out_c_per_core +
+                           (core_id < out_c_rem ? core_id : out_c_rem);
+    uint32_t out_c_count = out_c_per_core +
+                           (core_id < out_c_rem ? 1 : 0);
 
-    // 2) 单行输入缓冲区 (in_channels × W, 最大 64*128=8192 halfs = 16KB)
-    __nram__ half nram_in_row[MAX_IN_CH * MAX_HW];
+    // 为简化地址计算，预先提取步长
+    int input_N_stride  = C_in * H * W;
+    int input_C_stride  = H * W;
+    int input_H_stride  = W;
 
-    // 3) 累加器 (out_channels_in_group × W_out, float 精度)
-    //    这里用一个 core 处理的 co_count 个输出通道 × W_out
-    __nram__ float nram_accum[MAX_OUT_CH * MAX_HW];
+    int output_N_stride = C_out * H_out * W_out;
+    int output_C_stride = H_out * W_out;
+    int output_H_stride = W_out;
 
-    // 4) 处理偏移后的临时行
-    __nram__ half nram_shifted[MAX_HW + 4];
-    __nram__ half nram_temp[MAX_HW];
+    int kernel_C_stride = C_in * K * K;   // 每个输出通道的权重元素数
+    int kernel_IC_stride = K * K;         // 每个输入通道在同一个输出通道中的跨度
 
-    // ---- 步骤 1: 将所有输出通道的核权重加载到 NRAM ----
-    // kernel 布局: [out_channels, in_channels, kernel_size, kernel_size]
-    for (int co = 0; co < co_count; ++co) {
-        int c_out = co_start + co;
-        __memcpy(
-            nram_all_kernels + co * kernel_vol,
-            kernel + c_out * kernel_vol,
-            kernel_vol * sizeof(half),
-            GDRAM2NRAM
-        );
-    }
+    // NRAM 变量：用于存放一个标量输入、一个标量输出
+    __nram__ float nram_input_val;
+    __nram__ float nram_out_val;
+    // 权重缓冲区（复用）
+    __nram__ float nram_weight[MAX_NRAM_WEIGHT_ELEMS];
 
-    // ---- 步骤 2: 逐 batch 逐行处理 ----
-    for (int n = 0; n < batch; ++n) {
-        half *x_batch = x + n * in_channels * H * W;
+    // 外层：按权重块处理本核负责的输出通道
+    // 计算每次能装入的最大输出通道数
+    int weight_per_oc = C_in * K * K;                // 每个输出通道的权重数
+    int oc_chunk = MAX_NRAM_WEIGHT_ELEMS / weight_per_oc; // 每次处理的输出通道数
+    if (oc_chunk < 1) oc_chunk = 1;                  // 极端情况兜底
 
-        for (int h = 0; h < H_out; ++h) {
-            // 初始化累加器为 0
-            for (int i = 0; i < co_count * W_out; ++i) {
-                nram_accum[i] = 0.0f;
-            }
+    // 遍历本核的输出通道，步长为 oc_chunk
+    for (uint32_t oc_start = 0; oc_start < out_c_count; oc_start += oc_chunk) {
+        uint32_t oc_end = oc_start + oc_chunk;
+        if (oc_end > out_c_count) oc_end = out_c_count;
+        uint32_t oc_len = oc_end - oc_start;         // 本次实际处理的输出通道数
 
-            // 遍历输入通道
-            for (int ci = 0; ci < in_channels; ++ci) {
-                // 遍历卷积核行
-                for (int ki = 0; ki < kernel_size; ++ki) {
-                    int h_in = h - padding + ki * dilation;
-                    if (h_in < 0 || h_in >= H) continue;
+        // 将对应的权重块搬入 NRAM
+        uint32_t weight_offset = (out_c_start + oc_start) * kernel_C_stride;
+        uint32_t weight_bytes  = oc_len * weight_per_oc * sizeof(float);
+        __memcpy(nram_weight, kernel + weight_offset, weight_bytes, GDRAM2NRAM);
 
-                    // 通过 DMA 加载输入行: x_batch[ci][h_in][0:W]
-                    __memcpy(
-                        nram_in_row,
-                        x_batch + ci * H * W + h_in * W,
-                        W * sizeof(half),
-                        GDRAM2NRAM
-                    );
+        // 遍历 batch 和空间位置
+        for (int n = 0; n < N; ++n) {
+            float *input_n = input + n * input_N_stride;
+            float *output_n = output + n * output_N_stride;
+            for (int h_out = 0; h_out < H_out; ++h_out) {
+                for (int w_out = 0; w_out < W_out; ++w_out) {
+                    // 处理当前块内每一个输出通道
+                    for (uint32_t oc = 0; oc < oc_len; ++oc) {
+                        float accum = 0.0f;
 
-                    // 遍历卷积核列
-                    for (int kj = 0; kj < kernel_size; ++kj) {
-                        int w_offset = -padding + kj * dilation;  // -2, 0, or +2
+                        // 内层累加：所有输入通道、所有卷积核位置
+                        for (int ic = 0; ic < C_in; ++ic) {
+                            for (int kh = 0; kh < K; ++kh) {
+                                int in_h = h_out + kh * dilation - padding;
+                                // 垂直边界检查（零填充）
+                                if (in_h < 0 || in_h >= H) continue;
 
-                        // 构建带偏移的输入行（越界补零）
-                        for (int w = 0; w < W_out; ++w) {
-                            int w_in = w + w_offset;
-                            nram_shifted[w] = (w_in >= 0 && w_in < W) ? nram_in_row[w_in] : (half)0.0f;
-                        }
+                                float *input_ic_h = input_n + ic * input_C_stride + in_h * input_H_stride;
+                                for (int kw = 0; kw < K; ++kw) {
+                                    int in_w = w_out + kw * dilation - padding;
+                                    // 水平边界检查
+                                    if (in_w < 0 || in_w >= W) continue;
 
-                        // 对该 (ci, ki, kj) 位置，遍历所有输出通道
-                        // nram_all_kernels 布局: [co][ci][ki][kj]
-                        for (int co_idx = 0; co_idx < co_count; ++co_idx) {
-                            half weight = nram_all_kernels[
-                                co_idx * kernel_vol +
-                                ci * kernel_size * kernel_size +
-                                ki * kernel_size +
-                                kj
-                            ];
+                                    // 读取单个输入元素到 NRAM
+                                    __memcpy(&nram_input_val,
+                                             input_ic_h + in_w,
+                                             sizeof(float),
+                                             GDRAM2NRAM);
 
-                            // 向量化乘加: accum[co][w] += shifted[w] * weight
-                            __bang_mul_scalar(nram_temp, nram_shifted, (float)weight, W_out);
-                            for (int w = 0; w < W_out; ++w) {
-                                nram_accum[co_idx * W_out + w] += (float)nram_temp[w];
+                                    // 读取 NRAM 中的权重
+                                    float w = nram_weight[oc * kernel_C_stride +
+                                                          ic * kernel_IC_stride +
+                                                          kh * K + kw];
+                                    accum += nram_input_val * w;
+                                }
                             }
                         }
+
+                        // 写回当前输出像素
+                        nram_out_val = accum;
+                        int c_out_global = out_c_start + oc_start + oc;
+                        float *out_pos = output_n + c_out_global * output_C_stride
+                                                  + h_out * output_H_stride
+                                                  + w_out;
+                        __memcpy(out_pos, &nram_out_val, sizeof(float), NRAM2GDRAM);
                     }
-                }
-            }
-
-            // 写回输出行
-            for (int co_idx = 0; co_idx < co_count; ++co_idx) {
-                int c_out = co_start + co_idx;
-                half *y_row = output +
-                    n * out_channels * H_out * W_out +
-                    c_out * H_out * W_out +
-                    h * W_out;
-
-                for (int w = 0; w < W_out; ++w) {
-                    y_row[w] = (half)nram_accum[co_idx * W_out + w];
                 }
             }
         }
     }
 }
 
-/**
- * 外部调用函数
- */
+
+/*----------------------------------------------------------------------------
+ * PyTorch 封装函数
+ * 参数：
+ *   x           : 输入 [N, C_in, H, W]
+ *   kernel      : 卷积核 [C_out, C_in, K, K]
+ *   in_channels : 输入通道数 C_in
+ *   out_channels: 输出通道数 C_out
+ *   kernel_size : 卷积核大小 K
+ *   dilation    : 膨胀系数
+ *   padding     : 单边填充宽度
+ * 返回：
+ *   输出张量 [N, C_out, H_out, W_out]
+ *--------------------------------------------------------------------------*/
 torch::Tensor bang_func(
     torch::Tensor x,
     torch::Tensor kernel,
@@ -157,32 +156,54 @@ torch::Tensor bang_func(
     int dilation,
     int padding)
 {
-    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
-    TORCH_CHECK(kernel.is_contiguous(), "kernel must be contiguous");
-    TORCH_CHECK(x.scalar_type() == torch::kHalf, "x must be float16");
-    TORCH_CHECK(kernel.scalar_type() == torch::kHalf, "kernel must be float16");
+    // 确保输入和卷积核在内存中连续
+    TORCH_CHECK(x.is_contiguous(), "Input x must be contiguous");
+    TORCH_CHECK(kernel.is_contiguous(), "Kernel must be contiguous");
 
-    auto dims = x.sizes();
-    int batch = dims[0];
-    int H = dims[2];
-    int W = dims[3];
+    // 保留原始数据类型，内部统一用 float32 计算
+    auto original_dtype = x.scalar_type();
+    torch::Tensor x_fp32 = x;
+    torch::Tensor kernel_fp32 = kernel;
+    if (original_dtype != torch::kFloat) {
+        x_fp32 = x.to(torch::kFloat);
+        kernel_fp32 = kernel.to(torch::kFloat);
+    }
 
-    int H_out = (H + 2 * padding - dilation * (kernel_size - 1) - 1) + 1;
-    int W_out = (W + 2 * padding - dilation * (kernel_size - 1) - 1) + 1;
+    // 获取输入维度
+    int N = x_fp32.size(0);
+    int C_in = x_fp32.size(1);
+    int H = x_fp32.size(2);
+    int W = x_fp32.size(3);
+    int K = kernel_size;
 
-    auto output = torch::empty({batch, out_channels, H_out, W_out}, x.options());
+    // 计算输出尺寸 (stride = 1)
+    int H_out = H + 2 * padding - dilation * (K - 1);
+    int W_out = W + 2 * padding - dilation * (K - 1);
+    TORCH_CHECK(H_out > 0 && W_out > 0, "Output size must be positive");
 
+    // 分配输出张量
+    auto output_fp32 = torch::empty({N, out_channels, H_out, W_out},
+                                    x_fp32.options());
+
+    // 获取 MLU 流
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    // 启动配置：使用 4 个核
     cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
-    dilated_conv2d_kernel<<<dim, ktype, queue>>>(
-        reinterpret_cast<half*>(x.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(kernel.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(output.data_ptr<at::Half>()),
-        batch, in_channels, out_channels,
-        H, W, kernel_size, dilation, padding
+    // 调用核函数
+    conv2d_kernel<<<dim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        kernel_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        N, C_in, H, W, out_channels,
+        K, dilation, padding
     );
 
-    return output;
+    // 转回原始数据类型
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+    return output_fp32;
 }
