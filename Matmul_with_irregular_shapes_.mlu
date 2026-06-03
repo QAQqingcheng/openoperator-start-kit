@@ -1,20 +1,20 @@
-// matmul.mlu
+// bang.mlu
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
 
-// 假设 K 不超过 4096，便于在 NRAM 中分配静态缓冲区
-#define MAX_K 4096
+// NRAM 大小按 float16 元素计算（假设 NRAM 为 256KB）
+#define NRAM_SIZE (256 * 1024 / 2)  // half 元素个数
+#define ALIGN_SIZE 128
 
-// 核函数：计算 C = A * B
-// A: [M, K], B: [K, N], C: [M, N]
+// 矩阵乘法核函数（多核拆分 M 维度）
 __mlu_entry__ void matmul_kernel(
-    float *A,
-    float *B,
-    float *C,
+    half *C,        // 输出 [M, N]
+    const half *A,  // 输入 [M, K]
+    const half *B,  // 输入 [K, N]
     int M, int K, int N) {
 
-    // 多核分配行（M 维度）
+    // 多核分配：按 M 维度拆分
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
     uint32_t per_core = M / core_num;
@@ -24,97 +24,104 @@ __mlu_entry__ void matmul_kernel(
     uint32_t num_rows = per_core +
                         (core_id < remainder ? 1 : 0);
 
-    // 对齐 K 到 64 的倍数（向量化操作要求）
-    uint32_t aligned_K = (K + 63) & ~63;
-    // 断言 K 不超过 MAX_K
-    if (K > MAX_K) {
-        // 实际生产中应实现 K 分块，此处简化处理
-        return;
-    }
+    // 确定单次能处理的最大 K 维度（受 NRAM 容量限制）
+    // 需要存放：A 的一块 (block_m × K_eff) + B 的一块 (K_eff × block_n) + C 的一块 (block_m × block_n)
+    // 简化处理：每次处理一行 A（1×K）和若干列 B（K×block_n）
+    uint32_t block_n = (NRAM_SIZE - K) / (K + 1);  // 粗略估算
+    block_n = (block_n > N) ? N : block_n;
+    // 对齐到 64 的倍数（向量化要求）
+    block_n = (block_n / 64) * 64;
+    if (block_n < 64) block_n = 64;
 
-    // NRAM 缓冲区（均为 float，大小 MAX_K）
-    __nram__ float a_row_orig[MAX_K];
-    __nram__ float b_col_buf[MAX_K];
-    __nram__ float temp_buf[MAX_K];
+    // NRAM 缓冲区
+    __nram__ half a_row[NRAM_SIZE];     // 存放 A 的一行或一块
+    __nram__ half b_block[NRAM_SIZE];   // 存放 B 的一块
+    __nram__ half c_block[NRAM_SIZE];   // 存放 C 的一块
 
     // 遍历当前核负责的行
-    for (uint32_t row = start_row; row < start_row + num_rows; ++row) {
-        // 1. 加载 A 的一行到 a_row_orig，并补齐对齐部分为零
-        __memcpy(a_row_orig, A + row * K, K * sizeof(float), GDRAM2NRAM);
-        if (aligned_K > K) {
-            __bang_memset((void*)(a_row_orig + K), 0,
-                          (aligned_K - K) * sizeof(float));
-        }
+    for (uint32_t r = 0; r < num_rows; r++) {
+        uint32_t row = start_row + r;
 
-        // 2. 遍历所有列 (n)
-        for (int n = 0; n < N; ++n) {
-            // 2.1 加载 B 的一列（从 B 的列主序位置）
-            // 使用 2D memcpy: 源步长为 N * sizeof(float)，目标步长为 sizeof(float)
-            // 复制 K 行，每行 1 个元素
-            __memcpy(b_col_buf,          // 目标地址
-                     B + n,              // 源起始地址 (第 0 行第 n 列)
-                     K,                  // 行数
-                     1,                  // 列数
-                     GDRAM2NRAM,         // 传输方向
-                     N * sizeof(float),  // 源行步长 (行主序，行间跳 N 个元素)
-                     sizeof(float));     // 目标行步长 (连续存放)
+        // 加载 A 的第 row 行到 NRAM
+        __memcpy(a_row, A + row * K, K * sizeof(half), GDRAM2NRAM);
 
+        // 按 N 维度分块
+        for (uint32_t n_start = 0; n_start < N; n_start += block_n) {
+            uint32_t cur_block_n = (n_start + block_n <= N) ? block_n : (N - n_start);
+            uint32_t aligned_n = (cur_block_n + 63) & ~63;
+
+            // 加载 B 的一块：K × cur_block_n
+            // 使用 2D memcpy 逐行拷贝（因为 B 按行主序存储）
+            for (uint32_t kk = 0; kk < K; kk++) {
+                __memcpy(b_block + kk * aligned_n,
+                         B + kk * N + n_start,
+                         cur_block_n * sizeof(half),
+                         GDRAM2NRAM);
+            }
             // 补齐对齐部分为零
-            if (aligned_K > K) {
-                __bang_memset((void*)(b_col_buf + K), 0,
-                              (aligned_K - K) * sizeof(float));
+            if (aligned_n > cur_block_n) {
+                __bang_memset((void*)(b_block + K * aligned_n - (aligned_n - cur_block_n)),
+                              0, (aligned_n - cur_block_n) * sizeof(half));
             }
 
-            // 2.2 计算点积: sum_k a_row[k] * b_col[k]
-            // 逐元素乘 -> temp_buf
-            __bang_mul(temp_buf, a_row_orig, b_col_buf, aligned_K);
-            // 求和归约 -> 结果存于 temp_buf[0]
-            __bang_sum_reduce(temp_buf, aligned_K);
+            // 使用 __bang_matmul 计算一行 * 一块
+            // __bang_matmul(dst, src0, src1, m, k, n)
+            // dst: m×n, src0: m×k, src1: k×n
+            // 这里 m=1, k=K, n=aligned_n
+            // 注意：输入 A 需要放在 NRAM 的连续区域，且对齐
+            __bang_matmul(c_block, a_row, b_block, 1, K, aligned_n);
 
-            // 2.3 写回 C[row][n]
-            C[row * N + n] = temp_buf[0];
+            // 将结果写回 GDRAM
+            __memcpy(C + row * N + n_start,
+                     c_block,
+                     cur_block_n * sizeof(half),
+                     NRAM2GDRAM);
         }
     }
 }
 
-// 外部调用函数，必须命名为 bang_func
+
 torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     // 基本检查
     TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
     TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
     TORCH_CHECK(A.dim() == 2 && B.dim() == 2, "A and B must be 2D");
-    TORCH_CHECK(A.size(1) == B.size(0), "Inner dims must match (A: MxK, B: KxN)");
+    TORCH_CHECK(A.size(1) == B.size(0), "Inner dims must match");
 
-    // 保留原始 dtype（要求为 float16）
+    // 保留原始 dtype（应为 float16）
     auto original_dtype = A.scalar_type();
-    // 内部统一使用 float 计算
-    torch::Tensor A_fp32 = A;
-    torch::Tensor B_fp32 = B;
-    if (original_dtype != torch::kFloat) {
-        A_fp32 = A.to(torch::kFloat);
-        B_fp32 = B.to(torch::kFloat);
+    TORCH_CHECK(original_dtype == torch::kHalf || original_dtype == torch::kFloat,
+                "Only float16 and float32 are supported");
+
+    // 如果输入是 float32，转成 float16 以匹配题目要求
+    torch::Tensor A_h = A;
+    torch::Tensor B_h = B;
+    if (original_dtype == torch::kFloat) {
+        A_h = A.to(torch::kHalf);
+        B_h = B.to(torch::kHalf);
     }
 
-    int M = A_fp32.size(0);
-    int K = A_fp32.size(1);
-    int N = B_fp32.size(1);
-    auto C_fp32 = torch::empty({M, N}, A_fp32.options());
+    int M = A_h.size(0);
+    int K = A_h.size(1);
+    int N = B_h.size(1);
 
-    // MLU 流及核函数配置（4 核并行）
+    auto C_h = torch::empty({M, N}, A_h.options());
+
+    // MLU 流及核函数配置（使用全部可用 core）
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {4, 1, 1};
+    cnrtDim3_t dim = {4, 1, 1};  // 4 核并行
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
     matmul_kernel<<<dim, ktype, queue>>>(
-        A_fp32.data_ptr<float>(),
-        B_fp32.data_ptr<float>(),
-        C_fp32.data_ptr<float>(),
+        C_h.data_ptr<torch::Half>(),
+        A_h.data_ptr<torch::Half>(),
+        B_h.data_ptr<torch::Half>(),
         M, K, N
     );
 
-    // 转回原始 dtype (float16)
-    if (original_dtype != torch::kFloat) {
-        return C_fp32.to(original_dtype);
+    // 如果原始输入是 float32，结果转回 float32
+    if (original_dtype == torch::kFloat) {
+        return C_h.to(torch::kFloat);
     }
-    return C_fp32;
+    return C_h;
 }
