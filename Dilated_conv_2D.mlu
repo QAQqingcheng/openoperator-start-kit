@@ -3,8 +3,14 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#define CHUNK_SIZE 4096
+#define CHUNK_SIZE  4096      // NRAM 单次处理的最大元素数
+#define TILE_M      64        // 输出通道分片
+#define TILE_N      64        // 空间位置分片
 
+/**
+ * @brief 对单 batch 做 im2col + matmul 的二维卷积核函数
+ * @note  Stride=1, bias=0，完全等价于 PyTorch 的 nn.Conv2d
+ */
 __mlu_entry__ void conv2d_kernel(
     const float* input,
     const float* kernel,
@@ -20,72 +26,111 @@ __mlu_entry__ void conv2d_kernel(
     int dilation,
     int padding) {
 
-    // ========== 多核任务拆分 ==========
-    int total = batch * out_c * H_out * W_out;
-    uint32_t core_id   = taskId;
-    uint32_t core_num  = taskDim;
-    uint32_t per_core  = total / core_num;
-    uint32_t remainder = total % core_num;
+    int K = kernel_size;
+    int K2 = K * K;
 
-    uint32_t start = core_id * per_core +
-                     (core_id < remainder ? core_id : remainder);
-    uint32_t count = per_core +
-                     (core_id < remainder ? 1 : 0);
+    int task_dim = out_c * H_out * W_out;   // 每个 batch 的输出元素个数
 
-    // ========== NRAM 缓冲区 ==========
-    __nram__ float nram_out[CHUNK_SIZE];
+    // ======== 多核拆分：按 batch 维度 ========
+    uint32_t core_id  = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_batch = batch / core_num;
+    uint32_t rem_batch = batch % core_num;
+    uint32_t n_start = core_id * per_batch + (core_id < rem_batch ? core_id : rem_batch);
+    uint32_t n_end   = n_start + per_batch + (core_id < rem_batch ? 1 : 0);
 
-    // 本核负责的输出元素范围
-    uint32_t end = start + count;
+    // ======== NRAM 缓冲区 ========
+    __nram__ float nram_im2col[CHUNK_SIZE];   // 存储展开后的输入块
+    __nram__ float nram_kernel[CHUNK_SIZE];   // 存储卷积核分片
+    __nram__ float nram_out[CHUNK_SIZE];      // 存储输出累加
 
-    for (uint32_t base = start; base < end; base += CHUNK_SIZE) {
+    __nram__ float nram_tmp[CHUNK_SIZE];      // 临时缓冲区
 
-        uint32_t len = (base + CHUNK_SIZE <= end)
-                           ? CHUNK_SIZE
-                           : (end - base);
+    // 每个 batch 独立计算
+    for (uint32_t n = n_start; n < n_end; ++n) {
 
-        // 逐元素计算并写入 NRAM
-        for (uint32_t local = 0; local < len; ++local) {
-            uint32_t idx = base + local;
+        // ---------- 输出通道维度分片 (每片 TILE_M) ----------
+        for (uint32_t oc_base = 0; oc_base < out_c; oc_base += TILE_M) {
+            uint32_t oc_len = (oc_base + TILE_M <= out_c) ? TILE_M : (out_c - oc_base);
 
-            // 线性索引 → (n, oc, hout, wout)
-            int n   = idx / (out_c * H_out * W_out);
-            int rem = idx % (out_c * H_out * W_out);
-            int oc  = rem / (H_out * W_out);
-            int spt = rem % (H_out * W_out);
-            int hout = spt / W_out;
-            int wout = spt % W_out;
+            // 初始化本通道分片的输出→空间区域归零
+            // output 索引: n * out_c * H_out * W_out + oc_base * H_out * W_out
+            float* out_base = output + (n * out_c + oc_base) * H_out * W_out;
 
-            float sum = 0.0f;
+            // ---------- 输入通道维度分片 (每片处理一轮) ----------
+            // 为简单起见，按 in_c 维度循环，每次加载一个输入通道的 im2col
+            for (uint32_t ic = 0; ic < in_c; ++ic) {
 
-            // 三层循环完成卷积累加
-            for (int ic = 0; ic < in_c; ++ic) {
-                for (int kh = 0; kh < kernel_size; ++kh) {
-                    for (int kw = 0; kw < kernel_size; ++kw) {
-                        int hin = hout - padding + kh * dilation;
-                        int win = wout - padding + kw * dilation;
-                        if (hin >= 0 && hin < H && win >= 0 && win < W) {
-                            float x_val = input[
-                                ((n * in_c + ic) * H + hin) * W + win];
-                            float k_val = kernel[
-                                ((oc * in_c + ic) * kernel_size + kh) * kernel_size + kw];
-                            sum += x_val * k_val;
+                // ---------- 空间维度分片 (每片 TILE_N 个位置) ----------
+                for (uint32_t sp_base = 0; sp_base < H_out * W_out; sp_base += TILE_N) {
+                    uint32_t sp_len = (sp_base + TILE_N <= H_out * W_out) ? TILE_N : (H_out * W_out - sp_base);
+
+                    // im2col: 将输入通道 ic 在 sp_base 范围的感受野展平
+                    // 每个空间位置需要 K*K 个元素
+                    for (uint32_t s = 0; s < sp_len; ++s) {
+                        uint32_t sp_idx = sp_base + s;
+                        int hout = sp_idx / W_out;
+                        int wout = sp_idx % W_out;
+
+                        for (uint32_t k = 0; k < K2; ++k) {
+                            int kh = k / K;
+                            int kw = k % K;
+                            int hin = hout - padding + kh * dilation;
+                            int win = wout - padding + kw * dilation;
+                            float val = 0.0f;
+                            if (hin >= 0 && hin < H && win >= 0 && win < W) {
+                                val = input[((n * in_c + ic) * H + hin) * W + win];
+                            }
+                            nram_im2col[s * K2 + k] = val;
                         }
+                    }
+
+                    // -------- 对每个输出通道做乘加 --------
+                    for (uint32_t oc_off = 0; oc_off < oc_len; ++oc_off) {
+                        uint32_t oc = oc_base + oc_off;
+
+                        // 加载 kernel[oc, ic, :, :] 到 NRAM
+                        uint32_t k_offset = ((oc * in_c + ic) * K2);
+                        // kernel 形状 [out_c, in_c, K, K]，取连续 K*K 个元素
+                        __memcpy(nram_kernel,
+                                 kernel + k_offset,
+                                 K2 * sizeof(float),
+                                 GDRAM2NRAM);
+
+                        // nram_tmp = im2col * kernel (逐元素乘)
+                        __bang_mul(nram_tmp,
+                                   nram_im2col,
+                                   nram_kernel,
+                                   sp_len * K2);
+
+                        // 沿 K*K 维度求和，得到 sp_len 长度的向量
+                        // 使用 BangC 的 reduce sum
+                        for (uint32_t s = 0; s < sp_len; ++s) {
+                            nram_tmp[s] = nram_tmp[s * K2];
+                            for (uint32_t k = 1; k < K2; ++k) {
+                                nram_tmp[s] += nram_tmp[s * K2 + k];
+                            }
+                        }
+
+                        // 加载 out_base 中当前通道/位置的旧值，累加
+                        uint32_t out_offset = oc_off * H_out * W_out + sp_base;
+                        __memcpy(nram_out,
+                                 out_base + out_offset,
+                                 sp_len * sizeof(float),
+                                 GDRAM2NRAM);
+
+                        __bang_add(nram_out, nram_out, nram_tmp, sp_len);
+
+                        __memcpy(out_base + out_offset,
+                                 nram_out,
+                                 sp_len * sizeof(float),
+                                 NRAM2GDRAM);
                     }
                 }
             }
-            nram_out[local] = sum;
         }
-
-        // NRAM → GDRAM 批量写回
-        __memcpy(
-            output + base,
-            nram_out,
-            len * sizeof(float),
-            NRAM2GDRAM);
     }
 }
-
 
 // ==================== C++ Wrapper ====================
 torch::Tensor bang_func(
@@ -108,7 +153,7 @@ torch::Tensor bang_func(
     int H_out = H + 2 * padding - dilation * (kernel_size - 1);
     int W_out = W + 2 * padding - dilation * (kernel_size - 1);
 
-    // 类型统一为 float
+    // 统一转为 float32
     auto original_dtype = x.scalar_type();
     torch::Tensor x_fp32 = x;
     torch::Tensor k_fp32 = kernel;
@@ -117,13 +162,14 @@ torch::Tensor bang_func(
         k_fp32 = kernel.to(torch::kFloat);
     }
 
-    auto output_fp32 = torch::empty(
+    auto output_fp32 = torch::zeros(
         {batch, out_channels, H_out, W_out},
         x_fp32.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    cnrtDim3_t dim = {4, 1, 1};
+    // 使用更多核心加速（16核基本能覆盖 batch=16）
+    cnrtDim3_t dim = {16, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
     conv2d_kernel<<<dim, ktype, queue>>>(
