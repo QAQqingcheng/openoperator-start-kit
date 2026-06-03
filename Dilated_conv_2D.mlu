@@ -1,0 +1,142 @@
+// conv2d.mlu
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CHUNK_SIZE 4096
+#define NRAM_FLOAT_SIZE (CHUNK_SIZE * sizeof(float))
+
+/**
+ * 核函数：执行带填充和空洞的二维卷积
+ * 输入数据类型为 half（float16），内部使用 float 计算以保证精度
+ */
+__mlu_entry__ void conv2d_kernel(
+    half *input,        // [batch, in_channels, H, W]
+    half *kernel,       // [out_channels, in_channels, kernel_size, kernel_size]
+    half *output,       // [batch, out_channels, H_out, W_out]
+    int batch,
+    int in_channels,
+    int out_channels,
+    int H,
+    int W,
+    int kernel_size,
+    int dilation,
+    int padding)
+{
+    // 输出尺寸计算（stride=1）
+    int H_out = (H + 2 * padding - dilation * (kernel_size - 1) - 1) + 1;
+    int W_out = (W + 2 * padding - dilation * (kernel_size - 1) - 1) + 1;
+    int total_out = batch * out_channels * H_out * W_out;
+
+    // 多核拆分：每个 core 处理一段连续的输出元素
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = total_out / core_num;
+    uint32_t remainder = total_out % core_num;
+
+    uint32_t start = core_id * per_core + (core_id < remainder ? core_id : remainder);
+    uint32_t count = per_core + (core_id < remainder ? 1 : 0);
+    if (count == 0) return;
+
+    // NRAM 缓冲区（用于暂存卷积输入区间的数据）
+    __nram__ float nram_input[CHUNK_SIZE];
+    __nram__ float nram_accum[CHUNK_SIZE];
+    __nram__ float nram_weight[CHUNK_SIZE]; // 暂不连续使用，仅用于标量乘法
+
+    for (uint32_t out_idx = 0; out_idx < count; ++out_idx) {
+        // 将一维输出索引映射到四维坐标
+        int global_idx = start + out_idx;
+        int n = global_idx / (out_channels * H_out * W_out);
+        int rem1 = global_idx % (out_channels * H_out * W_out);
+        int c_out = rem1 / (H_out * W_out);
+        int rem2 = rem1 % (H_out * W_out);
+        int h = rem2 / W_out;
+        int w = rem2 % W_out;
+
+        // 计算填充后的输入坐标范围（带空洞）
+        int in_h_start = h * 1 - padding;                // stride=1
+        int in_w_start = w * 1 - padding;
+        int k_center = kernel_size / 2;                  // 假设 kernel_size 为奇数（常见）
+
+        float sum = 0.0f;
+        // 遍历输入通道和卷积核位置
+        for (int c_in = 0; c_in < in_channels; ++c_in) {
+            for (int ki = 0; ki < kernel_size; ++ki) {
+                for (int kj = 0; kj < kernel_size; ++kj) {
+                    int in_h = in_h_start + ki * dilation;
+                    int in_w = in_w_start + kj * dilation;
+                    // 检查是否在有效输入范围内
+                    if (in_h >= 0 && in_h < H && in_w >= 0 && in_w < W) {
+                        // 从 GDRAM 读取一个元素（标量），使用 __pen 或直接地址访问
+                        float input_val = (float)input[n * (in_channels * H * W) +
+                                                       c_in * (H * W) +
+                                                       in_h * W + in_w];
+                        float weight_val = (float)kernel[c_out * (in_channels * kernel_size * kernel_size) +
+                                                         c_in * (kernel_size * kernel_size) +
+                                                         ki * kernel_size + kj];
+                        sum += input_val * weight_val;
+                    }
+                }
+            }
+        }
+        // 将结果写入输出（转换为 half）
+        output[global_idx] = (half)sum;
+    }
+}
+
+/**
+ * 外部调用函数：符合要求，返回 torch::Tensor
+ * 输入为 float16 张量，内部计算使用 float，输出自动转回 float16
+ */
+torch::Tensor bang_func(
+    torch::Tensor x,            // [batch, in_channels, H, W]
+    torch::Tensor kernel,       // [out_channels, in_channels, kernel_size, kernel_size]
+    int in_channels,
+    int out_channels,
+    int kernel_size,
+    int dilation,
+    int padding)
+{
+    TORCH_CHECK(x.is_contiguous(), "Input x must be contiguous");
+    TORCH_CHECK(kernel.is_contiguous(), "Input kernel must be contiguous");
+    TORCH_CHECK(x.scalar_type() == torch::kHalf, "Input x must be float16");
+    TORCH_CHECK(kernel.scalar_type() == torch::kHalf, "Input kernel must be float16");
+
+    // 获取输入形状
+    auto dims = x.sizes();
+    int batch = dims[0];
+    int H = dims[2];
+    int W = dims[3];
+
+    // 计算输出尺寸
+    int H_out = (H + 2 * padding - dilation * (kernel_size - 1) - 1) + 1;
+    int W_out = (W + 2 * padding - dilation * (kernel_size - 1) - 1) + 1;
+
+    // 创建输出张量（float16）
+    auto output = torch::empty({batch, out_channels, H_out, W_out},
+                               x.options());
+
+    // 获取 MLU 流
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    // 设置并行维度：根据 MLU 硬件核心数，例如 4 核
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    // 启动核函数
+    conv2d_kernel<<<dim, ktype, queue>>>(
+        (half*)x.data_ptr<at::Half>(),
+        (half*)kernel.data_ptr<at::Half>(),
+        (half*)output.data_ptr<at::Half>(),
+        batch,
+        in_channels,
+        out_channels,
+        H,
+        W,
+        kernel_size,
+        dilation,
+        padding
+    );
+
+    return output;
+}
