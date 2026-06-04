@@ -3,18 +3,32 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
-#include <cmath>
 
 #define CHUNK_SIZE 1024
-#define NEG_INF     -3.402823e+38f
+#define NEG_INF     (-3.402823e+38f)
 
+// ---------------------------------------------------------------------------
+// NRAM 内部树形求和归约
+// 将 buf[0..len-1] 的元素求和，结果广播到 buf[0..len-1]
+// 要求 len 是 2 的幂
+// ---------------------------------------------------------------------------
+__mlu_func__ void nram_reduce_sum_broadcast(__nram__ float *buf, int len) {
+    for (int stride = len >> 1; stride >= 1; stride >>= 1) {
+        __bang_add(buf, buf, buf + stride, stride);
+        __memcpy(buf + stride, buf, stride * sizeof(float), NRAM2NRAM);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 内核入口
+// ---------------------------------------------------------------------------
 __mlu_entry__ void logsoftmax_dim1_kernel(
     float *input,
     float *output,
     int N,
     int C) {
 
-    // ---- 多核拆分（按 batch 维度）----
+    // ---- 多核拆分（按 batch 维度均分行）----
     uint32_t core_id   = taskId;
     uint32_t core_num  = taskDim;
     uint32_t rows_per_core = N / core_num;
@@ -27,18 +41,16 @@ __mlu_entry__ void logsoftmax_dim1_kernel(
 
     // ---- NRAM 工作区 ----
     __nram__ float buf[CHUNK_SIZE];
-    __nram__ float max_vec[CHUNK_SIZE];   // 存储当前行的最大值（广播）
-    __nram__ float tmp_max[CHUNK_SIZE];   // 临时 max
-    __nram__ float sum_vec[CHUNK_SIZE];   // 存储 exp 求和（广播）
-    __nram__ float tmp_sum[CHUNK_SIZE];   // 临时 sum
-    __nram__ float log_sum_vec[CHUNK_SIZE];
+    __nram__ float chunk_max[CHUNK_SIZE];
+    __nram__ float max_broadcast[CHUNK_SIZE];   // 全行 max 广播
+    __nram__ float logsum_broadcast[CHUNK_SIZE]; // log(sum_exp) 广播
 
     for (int i = 0; i < row_count; ++i) {
         float *row_in  = input  + (row_start + i) * C;
         float *row_out = output + (row_start + i) * C;
 
-        // ===== 第一遍：求行最大值 =====
-        __bang_write_value(max_vec, CHUNK_SIZE, NEG_INF);
+        // ==================== 第一遍：求行最大值 ====================
+        __bang_write_value(max_broadcast, CHUNK_SIZE, NEG_INF);
 
         for (int off = 0; off < C; off += CHUNK_SIZE) {
             int len = (off + CHUNK_SIZE <= C) ? CHUNK_SIZE : (C - off);
@@ -46,46 +58,56 @@ __mlu_entry__ void logsoftmax_dim1_kernel(
 
             __memcpy(buf, row_in + off, len * sizeof(float), GDRAM2NRAM);
 
-            // 当前块最大值（广播）
-            __bang_max(tmp_max, buf, aligned_len);
-            // 更新全局最大值（逐元素取 max，保持广播）
-            __bang_max(max_vec, max_vec, tmp_max, aligned_len);
+            // 3 参数版：规约求最大值并广播
+            __bang_max(chunk_max, buf, aligned_len);
+
+            if (chunk_max[0] > max_broadcast[0]) {
+                __bang_write_value(max_broadcast, CHUNK_SIZE, chunk_max[0]);
+            }
         }
 
-        // ===== 第二遍：exp 并求和 =====
-        __bang_write_zero(sum_vec, CHUNK_SIZE);
+        // ==================== 第二遍：exp 并求总和 ====================
+        float running_sum = 0.0f;
 
         for (int off = 0; off < C; off += CHUNK_SIZE) {
             int len = (off + CHUNK_SIZE <= C) ? CHUNK_SIZE : (C - off);
             int aligned_len = (len + 63) & ~63;
+            int pow2_len = 1;
+            while (pow2_len < aligned_len) pow2_len <<= 1;
+            if (pow2_len > CHUNK_SIZE) pow2_len = CHUNK_SIZE;
 
             __memcpy(buf, row_in + off, len * sizeof(float), GDRAM2NRAM);
 
-            // x - max
-            __bang_sub(buf, buf, max_vec, aligned_len);
-            // exp(x - max)
-            __bang_exp(buf, buf, aligned_len);
-            // 当前块求和（广播）
-            __bang_sum(tmp_sum, buf, aligned_len);
-            // 累加到总和中
-            __bang_add(sum_vec, sum_vec, tmp_sum, aligned_len);
+            // buf = x - max
+            __bang_sub(buf, buf, max_broadcast, pow2_len);
+
+            // buf = exp(x - max)
+            __bang_active_exp(buf, buf, pow2_len);
+
+            // 块内求和归约
+            nram_reduce_sum_broadcast(buf, pow2_len);
+            running_sum += buf[0];
         }
 
-        // ===== 计算 log(sum_exp) =====
-        // sum_vec 所有元素都是总和，取 log 广播到 log_sum_vec
-        __bang_log(log_sum_vec, sum_vec, CHUNK_SIZE);  // 注意：log_sum_vec 长度对齐
+        // ==================== 计算 log(sum_exp)，广播 ====================
+        // 用 __bang_log 计算 log(running_sum)
+        // 先将 running_sum 写入 buf[0]，做 log，再广播
+        __bang_write_value(buf, CHUNK_SIZE, running_sum);
+        __bang_log(logsum_broadcast, buf, CHUNK_SIZE);
+        // logsum_broadcast[i] = log(running_sum)，对所有 i
 
-        // ===== 第三遍：最终输出 =====
+        // ==================== 第三遍：最终输出 ====================
         for (int off = 0; off < C; off += CHUNK_SIZE) {
             int len = (off + CHUNK_SIZE <= C) ? CHUNK_SIZE : (C - off);
             int aligned_len = (len + 63) & ~63;
 
             __memcpy(buf, row_in + off, len * sizeof(float), GDRAM2NRAM);
 
-            // x - max
-            __bang_sub(buf, buf, max_vec, aligned_len);
-            // - log(sum_exp)
-            __bang_sub(buf, buf, log_sum_vec, aligned_len);
+            // buf = x - max
+            __bang_sub(buf, buf, max_broadcast, aligned_len);
+
+            // buf = (x - max) - log(sum_exp)
+            __bang_sub(buf, buf, logsum_broadcast, aligned_len);
 
             __memcpy(row_out + off, buf, len * sizeof(float), NRAM2GDRAM);
         }
@@ -93,26 +115,27 @@ __mlu_entry__ void logsoftmax_dim1_kernel(
 }
 
 
+// ===========================================================================
+// C++ Wrapper
+// ===========================================================================
 torch::Tensor bang_func(torch::Tensor x, int dim) {
-    // 检查输入条件
     TORCH_CHECK(x.is_contiguous(), "Input tensor must be contiguous");
-    TORCH_CHECK(x.dim() == 2, "Currently only 2D tensor [batch_size, dim] is supported");
+    TORCH_CHECK(x.dim() == 2, "Only 2D tensor [batch_size, dim] is supported");
     TORCH_CHECK(dim == 0 || dim == 1, "dim must be 0 or 1 for 2D tensor");
 
     auto original_dtype = x.scalar_type();
 
-    // 统一转为 float32 在 MLU 上计算
+    // 统一为 float32
     torch::Tensor x_fp32 = (original_dtype != torch::kFloat) ? x.to(torch::kFloat) : x;
 
-    // 如果 dim=0，转置为 dim=1 的情形处理，结果再转置回去
+    // dim=0 时转置为 dim=1 处理，结果再转置回去
     torch::Tensor input_for_kernel = (dim == 0) ? x_fp32.transpose(0, 1) : x_fp32;
 
-    int N = input_for_kernel.size(0);  // batch 方向
-    int C = input_for_kernel.size(1);  // 待 softmax 的维度
+    int N = input_for_kernel.size(0);
+    int C = input_for_kernel.size(1);
 
     auto output_fp32 = torch::empty_like(input_for_kernel);
 
-    // MLU 启动参数
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t dim3 = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
@@ -126,7 +149,6 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
     // 恢复原始维度顺序
     torch::Tensor result = (dim == 0) ? output_fp32.transpose(0, 1) : output_fp32;
 
-    // 转回原始 dtype
     if (original_dtype != torch::kFloat) {
         result = result.to(original_dtype);
     }
