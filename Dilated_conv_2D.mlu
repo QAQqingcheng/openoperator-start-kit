@@ -49,18 +49,18 @@ __mlu_entry__ void conv2d_kernel(
 
         // ---- 解码展平索引 → (b, oc, oh, ow) ----
         uint32_t tmp = idx;
-        int b  = tmp / out_per_batch;
-        tmp   %= out_per_batch;
-        int oc = tmp / H_out_W_out;
-        tmp   %= H_out_W_out;
-        int oh = tmp / W_out;
-        int ow = tmp % W_out;
+        int b  = (int)(tmp / (uint32_t)out_per_batch);
+        tmp   %= (uint32_t)out_per_batch;
+        int oc = (int)(tmp / (uint32_t)H_out_W_out);
+        tmp   %= (uint32_t)H_out_W_out;
+        int oh = (int)(tmp / (uint32_t)W_out);
+        int ow = (int)(tmp % (uint32_t)W_out);
 
         // 累加器初始化为 0
         nram_acc = 0.0f;
 
         // ---- 分块处理 kernel_len 个权重点积 ----
-        int offset = 0;  // 块起始偏移（元素个数）
+        int offset = 0;
         while (offset < kernel_len) {
             int cur_len = kernel_len - offset;
             if (cur_len > CHUNK_SIZE)
@@ -68,47 +68,49 @@ __mlu_entry__ void conv2d_kernel(
 
             // 1) 加载权重块 [oc, offset : offset+cur_len]
             __memcpy(nram_kernel,
-                     kernel + oc * kernel_len + offset,
+                     kernel + (uint64_t)oc * kernel_len + offset,
                      cur_len * sizeof(float),
                      GDRAM2NRAM);
 
-            // 2) 收集对应的感受野块（padding 通过置零实现）
-            __bang_mul_scalar(nram_patch, nram_patch, 0.0f, cur_len);
+            // 2) 收集对应的感受野块
+            {
+                // 先将 nram_patch 块置零
+                __bang_mul_scalar(nram_patch, nram_patch, 0.0f, cur_len);
 
-            // 计算该块对应的起始 (ic, kh, kw)
-            int start_ic = offset / K2;
-            int rem      = offset % K2;
-            int start_kh = rem / K;
-            int start_kw = rem % K;
+                int start_ic = offset / K2;
+                int rem_in   = offset % K2;
+                int start_kh = rem_in / K;
+                int start_kw = rem_in % K;
 
-            int ic = start_ic;
-            int kh = start_kh;
-            int kw = start_kw;
+                int ic = start_ic;
+                int kh = start_kh;
+                int kw = start_kw;
 
-            for (int pos = 0; pos < cur_len; ++pos) {
-                int hi = oh + kh * dilation - padding;
-                if (hi >= 0 && hi < H) {
-                    int wi = ow + kw * dilation - padding;
-                    if (wi >= 0 && wi < W) {
-                        int src_idx = b * in_spatial
-                                    + ic * (H * W)
-                                    + hi * W
-                                    + wi;
-                        __memcpy(nram_patch + pos,
-                                 input + src_idx,
-                                 sizeof(float),
-                                 GDRAM2NRAM);
+                for (int pos = 0; pos < cur_len; ++pos) {
+                    int hi = oh + kh * dilation - padding;
+                    if (hi >= 0 && hi < H) {
+                        int wi = ow + kw * dilation - padding;
+                        if (wi >= 0 && wi < W) {
+                            int src_idx = b * in_spatial
+                                        + ic * (H * W)
+                                        + hi * W
+                                        + wi;
+                            __memcpy(nram_patch + pos,
+                                     input + src_idx,
+                                     sizeof(float),
+                                     GDRAM2NRAM);
+                        }
                     }
-                }
 
-                // 推进 (ic, kh, kw)
-                ++kw;
-                if (kw >= K) {
-                    kw = 0;
-                    ++kh;
-                    if (kh >= K) {
-                        kh = 0;
-                        ++ic;
+                    // 推进 (ic, kh, kw)
+                    ++kw;
+                    if (kw >= K) {
+                        kw = 0;
+                        ++kh;
+                        if (kh >= K) {
+                            kh = 0;
+                            ++ic;
+                        }
                     }
                 }
             }
@@ -116,31 +118,34 @@ __mlu_entry__ void conv2d_kernel(
             // 3) 逐元素乘
             __bang_mul(nram_mul, nram_kernel, nram_patch, cur_len);
 
-            // 4) 树形归约求和 → 标量
+            // 4) 树形归约求和
             {
-                int rlen = cur_len;
-                // 拷贝到可原地修改的缓冲区（复用 nram_patch 避免污染 nram_mul）
+                // 对齐长度（避免尾数问题）
+                int aligned_len = (cur_len + 63) & ~63;
+                // 将多余位置清零，避免影响归约
+                // (nram_mul 中 cur_len..aligned_len-1 可能是脏数据)
+                // 复用 nram_patch 作为归约工作区
                 __memcpy(nram_patch, nram_mul,
-                         rlen * sizeof(float), NRAM2NRAM);
+                         cur_len * sizeof(float), NRAM2NRAM);
 
+                int rlen = cur_len;
                 while (rlen > 1) {
                     int step = rlen / 2;
                     __bang_add(nram_patch, nram_patch,
                                nram_patch + step, step);
-                    // 若 rlen 为奇数，将末位元素加到第 0 位
+                    // 奇数长度：末位并入首位
                     if (rlen & 1) {
                         nram_patch[0] += nram_patch[rlen - 1];
                     }
                     rlen = step + (rlen & 1);
                 }
-                // 结果在 nram_patch[0]
                 nram_acc += nram_patch[0];
             }
 
             offset += cur_len;
         }
 
-        // ---- 写出最终结果 ----
+        // ---- 写出结果 ----
         int dst_idx = b * out_per_batch
                     + oc * H_out_W_out
                     + oh * W_out
@@ -155,8 +160,8 @@ __mlu_entry__ void conv2d_kernel(
 #include <cnrt.h>
 
 torch::Tensor bang_func(
-    torch::Tensor x,               // [batch, in_channels, H, W]
-    torch::Tensor kernel,          // [out_channels, in_channels, K, K]
+    torch::Tensor x,
+    torch::Tensor kernel,
     int in_channels,
     int out_channels,
     int kernel_size,
@@ -165,5 +170,55 @@ torch::Tensor bang_func(
 {
     TORCH_CHECK(x.is_contiguous(),  "Input x must be contiguous");
     TORCH_CHECK(kernel.is_contiguous(), "Kernel must be contiguous");
-    TORCH_CHECK(x.dim() == 4,       "Input must be 4-D");
-    T
+    TORCH_CHECK(x.dim() == 4,       "Input x must be 4-D");
+    TORCH_CHECK(kernel.dim() == 4,  "Kernel must be 4-D");
+
+    int batch   = x.size(0);
+    int H       = x.size(2);
+    int W       = x.size(3);
+    int K       = kernel_size;
+
+    int H_out = H + 2 * padding - dilation * (K - 1);
+    int W_out = W + 2 * padding - dilation * (K - 1);
+
+    TORCH_CHECK(H_out > 0 && W_out > 0,
+                "Output spatial dimensions must be positive. "
+                "Check padding and dilation values.");
+
+    auto original_dtype = x.scalar_type();
+
+    torch::Tensor x_fp32 = x;
+    torch::Tensor k_fp32 = kernel;
+    if (original_dtype != torch::kFloat) {
+        x_fp32 = x.to(torch::kFloat);
+        k_fp32 = kernel.to(torch::kFloat);
+    }
+
+    auto output_fp32 = torch::empty(
+        {batch, out_channels, H_out, W_out},
+        x_fp32.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim   = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    conv2d_kernel<<<dim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        k_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        batch,
+        in_channels,
+        out_channels,
+        H,
+        W,
+        K,
+        dilation,
+        padding,
+        H_out,
+        W_out);
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+    return output_fp32;
+}
