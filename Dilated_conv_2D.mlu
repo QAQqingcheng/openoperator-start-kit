@@ -129,7 +129,7 @@ __mlu_entry__ void conv2d_kernel(
 
             // 4) 块内求和（需要对齐长度）
             int aligned_len = (cur_len + 63) & ~63;
-            __bang_nanosum(nram_sum, nram_mul, aligned_len);  // 结果在 nram_sum[0]
+            __bang_sum(nram_sum, nram_mul, aligned_len);  // 结果在 nram_sum[0]
 
             // 5) 累加到总累加器
             __bang_add_scalar(nram_acc, nram_acc, nram_sum[0], 1);
