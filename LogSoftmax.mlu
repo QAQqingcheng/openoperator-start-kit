@@ -1,0 +1,135 @@
+// logsoftmax.mlu
+
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <cmath>
+
+#define CHUNK_SIZE 1024
+#define NEG_INF     -3.402823e+38f
+
+__mlu_entry__ void logsoftmax_dim1_kernel(
+    float *input,
+    float *output,
+    int N,
+    int C) {
+
+    // ---- 多核拆分（按 batch 维度）----
+    uint32_t core_id   = taskId;
+    uint32_t core_num  = taskDim;
+    uint32_t rows_per_core = N / core_num;
+    uint32_t remainder = N % core_num;
+
+    uint32_t row_start = core_id * rows_per_core +
+                         (core_id < remainder ? core_id : remainder);
+    uint32_t row_count = rows_per_core +
+                         (core_id < remainder ? 1 : 0);
+
+    // ---- NRAM 工作区 ----
+    __nram__ float buf[CHUNK_SIZE];
+    __nram__ float max_vec[CHUNK_SIZE];   // 存储当前行的最大值（广播）
+    __nram__ float tmp_max[CHUNK_SIZE];   // 临时 max
+    __nram__ float sum_vec[CHUNK_SIZE];   // 存储 exp 求和（广播）
+    __nram__ float tmp_sum[CHUNK_SIZE];   // 临时 sum
+    __nram__ float log_sum_vec[CHUNK_SIZE];
+
+    for (int i = 0; i < row_count; ++i) {
+        float *row_in  = input  + (row_start + i) * C;
+        float *row_out = output + (row_start + i) * C;
+
+        // ===== 第一遍：求行最大值 =====
+        __bang_write_value(max_vec, CHUNK_SIZE, NEG_INF);
+
+        for (int off = 0; off < C; off += CHUNK_SIZE) {
+            int len = (off + CHUNK_SIZE <= C) ? CHUNK_SIZE : (C - off);
+            int aligned_len = (len + 63) & ~63;
+
+            __memcpy(buf, row_in + off, len * sizeof(float), GDRAM2NRAM);
+
+            // 当前块最大值（广播）
+            __bang_max(tmp_max, buf, aligned_len);
+            // 更新全局最大值（逐元素取 max，保持广播）
+            __bang_max(max_vec, max_vec, tmp_max, aligned_len);
+        }
+
+        // ===== 第二遍：exp 并求和 =====
+        __bang_write_zero(sum_vec, CHUNK_SIZE);
+
+        for (int off = 0; off < C; off += CHUNK_SIZE) {
+            int len = (off + CHUNK_SIZE <= C) ? CHUNK_SIZE : (C - off);
+            int aligned_len = (len + 63) & ~63;
+
+            __memcpy(buf, row_in + off, len * sizeof(float), GDRAM2NRAM);
+
+            // x - max
+            __bang_sub(buf, buf, max_vec, aligned_len);
+            // exp(x - max)
+            __bang_exp(buf, buf, aligned_len);
+            // 当前块求和（广播）
+            __bang_sum(tmp_sum, buf, aligned_len);
+            // 累加到总和中
+            __bang_add(sum_vec, sum_vec, tmp_sum, aligned_len);
+        }
+
+        // ===== 计算 log(sum_exp) =====
+        // sum_vec 所有元素都是总和，取 log 广播到 log_sum_vec
+        __bang_log(log_sum_vec, sum_vec, CHUNK_SIZE);  // 注意：log_sum_vec 长度对齐
+
+        // ===== 第三遍：最终输出 =====
+        for (int off = 0; off < C; off += CHUNK_SIZE) {
+            int len = (off + CHUNK_SIZE <= C) ? CHUNK_SIZE : (C - off);
+            int aligned_len = (len + 63) & ~63;
+
+            __memcpy(buf, row_in + off, len * sizeof(float), GDRAM2NRAM);
+
+            // x - max
+            __bang_sub(buf, buf, max_vec, aligned_len);
+            // - log(sum_exp)
+            __bang_sub(buf, buf, log_sum_vec, aligned_len);
+
+            __memcpy(row_out + off, buf, len * sizeof(float), NRAM2GDRAM);
+        }
+    }
+}
+
+
+torch::Tensor bang_func(torch::Tensor x, int dim) {
+    // 检查输入条件
+    TORCH_CHECK(x.is_contiguous(), "Input tensor must be contiguous");
+    TORCH_CHECK(x.dim() == 2, "Currently only 2D tensor [batch_size, dim] is supported");
+    TORCH_CHECK(dim == 0 || dim == 1, "dim must be 0 or 1 for 2D tensor");
+
+    auto original_dtype = x.scalar_type();
+
+    // 统一转为 float32 在 MLU 上计算
+    torch::Tensor x_fp32 = (original_dtype != torch::kFloat) ? x.to(torch::kFloat) : x;
+
+    // 如果 dim=0，转置为 dim=1 的情形处理，结果再转置回去
+    torch::Tensor input_for_kernel = (dim == 0) ? x_fp32.transpose(0, 1) : x_fp32;
+
+    int N = input_for_kernel.size(0);  // batch 方向
+    int C = input_for_kernel.size(1);  // 待 softmax 的维度
+
+    auto output_fp32 = torch::empty_like(input_for_kernel);
+
+    // MLU 启动参数
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim3 = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    logsoftmax_dim1_kernel<<<dim3, ktype, queue>>>(
+        input_for_kernel.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        N,
+        C);
+
+    // 恢复原始维度顺序
+    torch::Tensor result = (dim == 0) ? output_fp32.transpose(0, 1) : output_fp32;
+
+    // 转回原始 dtype
+    if (original_dtype != torch::kFloat) {
+        result = result.to(original_dtype);
+    }
+
+    return result;
+}
