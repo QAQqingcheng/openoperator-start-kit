@@ -35,17 +35,15 @@ __mlu_entry__ void conv2d_kernel(
 
     // ==================== 常量 ====================
     int K2          = K * K;
-    int kernel_len  = in_channels * K2;       // 一个 oc 的权重数
-    int in_spatial  = in_channels * H * W;    // 每个 batch 的输入元素数
+    int kernel_len  = in_channels * K2;         // 每个输出通道的权重个数
+    int in_spatial  = in_channels * H * W;      // 每个 batch 的输入元素数
 
     // ==================== NRAM 缓冲区 ====================
-    __nram__ float nram_kernel[CHUNK_SIZE];   // 卷积核权重
-    __nram__ float nram_patch[CHUNK_SIZE];    // 输入感受野
-    __nram__ float nram_mul[CHUNK_SIZE];      // 逐元素乘积
-    __nram__ float nram_reduce[CHUNK_SIZE];   // 归约累加
-
-    // ==================== 权重缓存 ====================
-    int cached_oc = -1;
+    __nram__ float nram_kernel[CHUNK_SIZE];     // 权重块
+    __nram__ float nram_patch[CHUNK_SIZE];      // 输入块
+    __nram__ float nram_mul[CHUNK_SIZE];        // 逐元素乘积
+    __nram__ float nram_sum[1];                 // 块内和
+    __nram__ float nram_acc[1];                 // 累加器
 
     // ==================== 逐输出元素计算 ====================
     for (uint32_t idx = start; idx < start + count; ++idx) {
@@ -59,78 +57,97 @@ __mlu_entry__ void conv2d_kernel(
         int oh = tmp / W_out;
         int ow = tmp % W_out;
 
-        // ---- 按需加载卷积核（同一 oc 复用）----
-        if (oc != cached_oc) {
-            __memcpy(
-                nram_kernel,
-                kernel + oc * kernel_len,
-                kernel_len * sizeof(float),
-                GDRAM2NRAM);
-            cached_oc = oc;
-        }
+        // 累加器初始化为 0
+        __bang_mul_scalar(nram_acc, nram_acc, 0.0f, 1);
 
-        // ---- 收集输入感受野（padding 由置零 + 有效区覆盖实现）----
-        // 先整块置零
-        __bang_mul_scalar(nram_patch, nram_patch, 0.0f, kernel_len);
+        // ---- 分块处理 kernel_len 个权重点积 ----
+        int offset = 0;  // 块起始偏移（元素个数）
+        while (offset < kernel_len) {
+            int cur_len = kernel_len - offset;
+            if (cur_len > CHUNK_SIZE)
+                cur_len = CHUNK_SIZE;
 
-        int pos = 0;
-        for (int ic = 0; ic < in_channels; ++ic) {
-            for (int kh = 0; kh < K; ++kh) {
-                int hi = oh + kh * dilation - padding;
-                if (hi < 0 || hi >= H) {
-                    pos += K;          // 整行越界，跳过 K 个位置（已为零）
-                    continue;
-                }
-                for (int kw = 0; kw < K; ++kw) {
-                    int wi = ow + kw * dilation - padding;
-                    if (wi >= 0 && wi < W) {
-                        int src_idx = b * in_spatial
-                                    + ic * (H * W)
-                                    + hi * W
-                                    + wi;
-                        __memcpy(
-                            nram_patch + pos,
-                            input + src_idx,
-                            sizeof(float),
-                            GDRAM2NRAM);
+            // 1) 加载权重块 [oc, offset : offset+cur_len]
+            __memcpy(nram_kernel,
+                     kernel + oc * kernel_len + offset,
+                     cur_len * sizeof(float),
+                     GDRAM2NRAM);
+
+            // 2) 收集对应的感受野块（padding 通过置零实现）
+            //    先将 nram_patch 对应区域全置零
+            __bang_mul_scalar(nram_patch, nram_patch, 0.0f, cur_len);
+
+            int pos_in_block = 0;  // 在 nram_patch 块内的偏移
+            int global_pos   = offset; // 全局偏移（对应权重索引）
+            // 需要遍历 ic, kh, kw 找到属于当前块的元素
+            // 因为 offset 可能不在通道或空间边界对齐，采用全局线性搜索
+            for (int ic = 0; ic < in_channels && global_pos < offset + cur_len; ++ic) {
+                for (int kh = 0; kh < K && global_pos < offset + cur_len; ++kh) {
+                    int hi = oh + kh * dilation - padding;
+                    if (hi < 0 || hi >= H) {
+                        // 整行越界，跳过 K 个位置
+                        int skip = K;
+                        if (global_pos < offset) {
+                            // 不在当前块内，仅更新 global_pos
+                            int advance = (global_pos + skip > offset + cur_len) ?
+                                          (offset + cur_len - global_pos) : skip;
+                            pos_in_block += advance;
+                            global_pos  += advance;
+                        } else {
+                            // 在块内，nram_patch 已经为 0，只需更新全局位置
+                            pos_in_block += K;
+                            global_pos  += K;
+                        }
+                        continue;
                     }
-                    ++pos;
+                    for (int kw = 0; kw < K && global_pos < offset + cur_len; ++kw) {
+                        if (global_pos < offset) {
+                            // 还未进入当前块，跳过
+                            ++global_pos;
+                            continue;
+                        }
+                        // 此时 global_pos 在 [offset, offset+cur_len) 内
+                        int wi = ow + kw * dilation - padding;
+                        if (wi >= 0 && wi < W) {
+                            int src_idx = b * in_spatial
+                                        + ic * (H * W)
+                                        + hi * W
+                                        + wi;
+                            __memcpy(nram_patch + pos_in_block,
+                                     input + src_idx,
+                                     sizeof(float),
+                                     GDRAM2NRAM);
+                        }
+                        ++pos_in_block;
+                        ++global_pos;
+                    }
                 }
             }
+
+            // 3) 逐元素乘
+            __bang_mul(nram_mul, nram_kernel, nram_patch, cur_len);
+
+            // 4) 块内求和（需要对齐长度）
+            int aligned_len = (cur_len + 63) & ~63;
+            __bang_nanosum(nram_sum, nram_mul, aligned_len);  // 结果在 nram_sum[0]
+
+            // 5) 累加到总累加器
+            __bang_add_scalar(nram_acc, nram_acc, nram_sum[0], 1);
+
+            offset += cur_len;
         }
 
-        // ---- 逐元素乘 ----
-        __bang_mul(nram_mul, nram_kernel, nram_patch, kernel_len);
-
-        // ---- 树形归约求和 ----
-        __memcpy(nram_reduce, nram_mul,
-                 kernel_len * sizeof(float), NRAM2NRAM);
-
-        int reduce_len = kernel_len;
-        while (reduce_len > 1) {
-            int half = reduce_len / 2;
-            __bang_add(nram_reduce, nram_reduce,
-                       nram_reduce + half, half);
-            // 奇数长度：将末位元素并入首位
-            if (reduce_len & 1) {
-                nram_reduce[0] += nram_reduce[reduce_len - 1];
-            }
-            reduce_len = half + (reduce_len & 1);
-        }
-
-        // ---- 写出结果 ----
+        // ---- 写出最终结果 ----
         int dst_idx = b * out_per_batch
                     + oc * H_out_W_out
                     + oh * W_out
                     + ow;
-
-        __memcpy(output + dst_idx, nram_reduce,
-                 sizeof(float), NRAM2GDRAM);
+        __memcpy(output + dst_idx, nram_acc, sizeof(float), NRAM2GDRAM);
     }
 }
 
 
-// ==================== C++ Wrapper ====================
+// ==================== C++ Wrapper（保持不变） ====================
 #include <torch/extension.h>
 #include <cnrt.h>
 
@@ -143,7 +160,6 @@ torch::Tensor bang_func(
     int dilation,
     int padding)
 {
-    // ---- 参数校验 ----
     TORCH_CHECK(x.is_contiguous(),  "Input x must be contiguous");
     TORCH_CHECK(kernel.is_contiguous(), "Kernel must be contiguous");
     TORCH_CHECK(x.dim() == 4,       "Input must be 4-D");
@@ -160,7 +176,6 @@ torch::Tensor bang_func(
     TORCH_CHECK(H_out > 0 && W_out > 0,
                 "Invalid padding/dilation: output spatial dims must be positive");
 
-    // ---- 保留原始 dtype ----
     auto original_dtype = x.scalar_type();
 
     torch::Tensor x_fp32 = x;
@@ -170,14 +185,12 @@ torch::Tensor bang_func(
         k_fp32 = kernel.to(torch::kFloat);
     }
 
-    // ---- 分配输出 ----
     auto output_fp32 = torch::empty(
         {batch, out_channels, H_out, W_out},
         x_fp32.options());
 
-    // ---- 启动 MLU 内核 ----
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim   = {4, 1, 1};          // 4 核
+    cnrtDim3_t dim   = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
     conv2d_kernel<<<dim, ktype, queue>>>(
@@ -195,7 +208,6 @@ torch::Tensor bang_func(
         H_out,
         W_out);
 
-    // ---- 转回原始 dtype ----
     if (original_dtype != torch::kFloat) {
         return output_fp32.to(original_dtype);
     }
